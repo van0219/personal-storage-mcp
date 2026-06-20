@@ -51,6 +51,9 @@ function connectSftp() {
       username: SFTP_USERNAME,
       password: SFTP_PASSWORD,
       tryKeyboard: true,
+      keepaliveInterval: 15000,
+      keepaliveCountMax: 3,
+      readyTimeout: 15000,
     });
   });
 }
@@ -170,8 +173,140 @@ const TOOLS = [
       },
       required: ["path"]
     }
+  },
+  {
+    name: "ps_push_files",
+    description: "Write multiple files in a single operation. Automatically creates any missing parent directories. Use this instead of calling ps_write_file repeatedly when creating project scaffolds or writing multiple files at once.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        files: {
+          type: "array",
+          description: "Array of files to write. Each item has a relative path and text content.",
+          items: {
+            type: "object",
+            properties: {
+              path: {
+                type: "string",
+                description: "Relative path for the file within your personal storage."
+              },
+              content: {
+                type: "string",
+                description: "Text content to write to the file."
+              }
+            },
+            required: ["path", "content"]
+          }
+        }
+      },
+      required: ["files"]
+    }
+  },
+  {
+    name: "ps_tree",
+    description: "Recursively list the entire directory tree within a path. Returns a flat list of all files and folders with their relative paths, types, and sizes. Useful for understanding project structure at a glance.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Relative path to list recursively. Use '/' or omit for root."
+        },
+        max_depth: {
+          type: "number",
+          description: "Maximum depth to recurse. Default: 10. Use -1 for unlimited."
+        }
+      }
+    }
+  },
+  {
+    name: "ps_file_exists",
+    description: "Check if a file or folder exists at the given path. Returns exists (boolean), type (file/directory), and size.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Relative path to check."
+        }
+      },
+      required: ["path"]
+    }
+  },
+  {
+    name: "ps_delete_recursive",
+    description: "Recursively delete a directory and all its contents (files and subdirectories). Use with caution.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Relative path of the directory to delete recursively."
+        },
+        confirm: {
+          type: "boolean",
+          description: "Must be set to true to confirm destructive operation."
+        }
+      },
+      required: ["path", "confirm"]
+    }
+  },
+  {
+    name: "ps_copy",
+    description: "Copy a file within your personal storage to a new path. Automatically creates parent directories for the destination.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: {
+          type: "string",
+          description: "Relative path of the source file."
+        },
+        destination: {
+          type: "string",
+          description: "Relative path for the copy destination."
+        }
+      },
+      required: ["source", "destination"]
+    }
+  },
+  {
+    name: "ps_stat",
+    description: "Get metadata (size, modification date, type) for a file or folder without reading its content.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Relative path of the file or folder."
+        }
+      },
+      required: ["path"]
+    }
   }
 ];
+
+// --- Shared Helpers ---
+
+const _createdDirsCache = new Set();
+
+async function mkdirRecursive(sftp, dirPath) {
+  if (_createdDirsCache.has(dirPath) || dirPath === BASE_PATH || !dirPath) return;
+  const exists = await new Promise((resolve) => {
+    sftp.stat(dirPath, (err, stats) => {
+      if (!err && stats) resolve(true); else resolve(false);
+    });
+  });
+  if (exists) { _createdDirsCache.add(dirPath); return; }
+  const parent = dirPath.substring(0, dirPath.lastIndexOf("/"));
+  if (parent && parent !== dirPath) await mkdirRecursive(sftp, parent);
+  await new Promise((resolve, reject) => {
+    sftp.mkdir(dirPath, (err) => {
+      if (err && err.code !== 4) reject(new Error(`mkdir ${dirPath}: ${err.message}`));
+      else resolve();
+    });
+  });
+  _createdDirsCache.add(dirPath);
+}
 
 // --- Tool Implementations ---
 
@@ -206,6 +341,18 @@ async function handlePsReadFile(args) {
   const sftp = await connectSftp();
   const filePath = resolvePath(args.path);
 
+  // Size guard: reject files over 5MB to prevent memory issues
+  const stats = await new Promise((resolve, reject) => {
+    sftp.stat(filePath, (err, s) => {
+      if (err) reject(new Error(`File not found: ${err.message}`));
+      else resolve(s);
+    });
+  });
+  const MAX_READ_SIZE = 5 * 1024 * 1024; // 5MB
+  if (stats.size > MAX_READ_SIZE) {
+    throw new Error(`File too large to read (${(stats.size / 1024 / 1024).toFixed(1)}MB). Maximum is 5MB. Use ps_stat to check size first.`);
+  }
+
   return new Promise((resolve, reject) => {
     const chunks = [];
     const stream = sftp.createReadStream(filePath, { encoding: "utf-8" });
@@ -218,6 +365,10 @@ async function handlePsReadFile(args) {
 async function handlePsWriteFile(args) {
   const sftp = await connectSftp();
   const filePath = resolvePath(args.path);
+
+  // Auto-create parent directories if they don't exist
+  const dirPath = filePath.substring(0, filePath.lastIndexOf("/"));
+  await mkdirRecursive(sftp, dirPath);
 
   return new Promise((resolve, reject) => {
     const stream = sftp.createWriteStream(filePath);
@@ -272,6 +423,185 @@ async function handlePsDelete(args) {
   });
 }
 
+async function handlePsPushFiles(args) {
+  const sftp = await connectSftp();
+  const files = args.files || [];
+  if (files.length === 0) return "No files to write.";
+
+  // Write each file
+  const results = [];
+  for (const file of files) {
+    const filePath = resolvePath(file.path);
+    const dirPath = filePath.substring(0, filePath.lastIndexOf("/"));
+    // Ensure directory exists
+    await mkdirRecursive(sftp, dirPath);
+    // Write the file
+    await new Promise((resolve, reject) => {
+      const stream = sftp.createWriteStream(filePath);
+      stream.on("close", () => resolve());
+      stream.on("error", (err) => reject(new Error(`write ${file.path}: ${err.message}`)));
+      stream.end(file.content || "");
+    });
+    results.push(file.path);
+  }
+
+  return `Successfully wrote ${results.length} file(s):\n${results.map(f => `  ✓ ${f}`).join("\n")}`;
+}
+
+async function handlePsTree(args) {
+  const sftp = await connectSftp();
+  const dirPath = resolvePath(args.path);
+  const maxDepth = args.max_depth === undefined ? 10 : (args.max_depth === -1 ? Infinity : args.max_depth);
+
+  const tree = [];
+
+  async function walk(currentPath, relativeTo, depth) {
+    if (depth > maxDepth) return;
+    const items = await new Promise((resolve, reject) => {
+      sftp.readdir(currentPath, (err, list) => {
+        if (err) { reject(new Error(err.message)); return; }
+        resolve(list || []);
+      });
+    });
+
+    for (const item of items) {
+      if (item.filename.startsWith(".")) continue;
+      const fullPath = `${currentPath}/${item.filename}`;
+      const relPath = fullPath.substring(relativeTo.length + 1);
+      const isDir = item.longname.startsWith("d");
+      tree.push({
+        path: relPath,
+        type: isDir ? "directory" : "file",
+        size: isDir ? null : item.attrs.size
+      });
+      if (isDir) {
+        await walk(fullPath, relativeTo, depth + 1);
+      }
+    }
+  }
+
+  await walk(dirPath, dirPath, 1);
+  return tree;
+}
+
+async function handlePsFileExists(args) {
+  const sftp = await connectSftp();
+  const targetPath = resolvePath(args.path);
+
+  return new Promise((resolve) => {
+    sftp.stat(targetPath, (err, stats) => {
+      if (err) {
+        resolve({ exists: false });
+      } else {
+        resolve({
+          exists: true,
+          type: stats.isDirectory() ? "directory" : "file",
+          size: stats.size,
+          modified: new Date(stats.mtime * 1000).toISOString()
+        });
+      }
+    });
+  });
+}
+
+async function handlePsDeleteRecursive(args) {
+  if (!args.confirm) {
+    throw new Error("You must set confirm: true to perform recursive deletion.");
+  }
+
+  const sftp = await connectSftp();
+  const targetPath = resolvePath(args.path);
+
+  // Ensure we're not deleting the base path itself
+  if (targetPath === BASE_PATH) {
+    throw new Error("Cannot delete the root storage directory.");
+  }
+
+  async function deleteDir(dirPath) {
+    const items = await new Promise((resolve, reject) => {
+      sftp.readdir(dirPath, (err, list) => {
+        if (err) reject(new Error(err.message));
+        else resolve(list || []);
+      });
+    });
+
+    for (const item of items) {
+      const fullPath = `${dirPath}/${item.filename}`;
+      if (item.longname.startsWith("d")) {
+        await deleteDir(fullPath);
+      } else {
+        await new Promise((resolve, reject) => {
+          sftp.unlink(fullPath, (err) => {
+            if (err) reject(new Error(`unlink ${fullPath}: ${err.message}`));
+            else resolve();
+          });
+        });
+      }
+    }
+
+    // Now remove the empty directory
+    await new Promise((resolve, reject) => {
+      sftp.rmdir(dirPath, (err) => {
+        if (err) reject(new Error(`rmdir ${dirPath}: ${err.message}`));
+        else resolve();
+      });
+    });
+  }
+
+  await deleteDir(targetPath);
+  // Clear cached dirs that were inside the deleted path
+  for (const cached of _createdDirsCache) {
+    if (cached.startsWith(targetPath)) _createdDirsCache.delete(cached);
+  }
+  return `Recursively deleted: ${args.path}`;
+}
+
+async function handlePsCopy(args) {
+  const sftp = await connectSftp();
+  const srcPath = resolvePath(args.source);
+  const destPath = resolvePath(args.destination);
+
+  // Ensure destination directory exists
+  const destDir = destPath.substring(0, destPath.lastIndexOf("/"));
+  await mkdirRecursive(sftp, destDir);
+
+  // Read source into buffer then write to destination
+  const content = await new Promise((resolve, reject) => {
+    const chunks = [];
+    const stream = sftp.createReadStream(srcPath);
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", (err) => reject(new Error(`Read failed: ${err.message}`)));
+  });
+
+  await new Promise((resolve, reject) => {
+    const stream = sftp.createWriteStream(destPath);
+    stream.on("close", () => resolve());
+    stream.on("error", (err) => reject(new Error(`Write failed: ${err.message}`)));
+    stream.end(content);
+  });
+
+  return `Copied: ${args.source} → ${args.destination}`;
+}
+
+async function handlePsStat(args) {
+  const sftp = await connectSftp();
+  const targetPath = resolvePath(args.path);
+
+  return new Promise((resolve, reject) => {
+    sftp.stat(targetPath, (err, stats) => {
+      if (err) reject(new Error(`Failed to stat: ${err.message}`));
+      else resolve({
+        path: args.path,
+        type: stats.isDirectory() ? "directory" : "file",
+        size: stats.size,
+        modified: new Date(stats.mtime * 1000).toISOString(),
+        accessed: new Date(stats.atime * 1000).toISOString()
+      });
+    });
+  });
+}
+
 // --- MCP Server Setup ---
 
 const server = new Server(
@@ -307,6 +637,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "ps_delete":
         result = await handlePsDelete(args);
         return { content: [{ type: "text", text: result }] };
+      case "ps_push_files":
+        result = await handlePsPushFiles(args);
+        return { content: [{ type: "text", text: result }] };
+      case "ps_tree":
+        result = await handlePsTree(args || {});
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      case "ps_file_exists":
+        result = await handlePsFileExists(args);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      case "ps_delete_recursive":
+        result = await handlePsDeleteRecursive(args);
+        return { content: [{ type: "text", text: result }] };
+      case "ps_copy":
+        result = await handlePsCopy(args);
+        return { content: [{ type: "text", text: result }] };
+      case "ps_stat":
+        result = await handlePsStat(args);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       default:
         return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
     }
