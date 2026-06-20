@@ -72,8 +72,18 @@ function resolvePath(relativePath) {
   if (!relativePath || relativePath === "/" || relativePath === ".") {
     return BASE_PATH;
   }
-  const clean = relativePath.replace(/^\/+/, "");
-  const full = `${BASE_PATH}/${clean}`;
+  // Strip leading slashes, normalize double slashes
+  let clean = relativePath.replace(/^\/+/, "").replace(/\/+/g, "/");
+  // Resolve .. and . segments to prevent traversal
+  const parts = clean.split("/");
+  const resolved = [];
+  for (const part of parts) {
+    if (part === "." || part === "") continue;
+    if (part === "..") { resolved.pop(); continue; }
+    resolved.push(part);
+  }
+  if (resolved.length === 0) return BASE_PATH;
+  const full = `${BASE_PATH}/${resolved.join("/")}`;
   return ensureSandbox(full);
 }
 
@@ -382,18 +392,19 @@ async function handlePsMkdir(args) {
   const sftp = await connectSftp();
   const dirPath = resolvePath(args.path);
 
-  return new Promise((resolve, reject) => {
-    sftp.mkdir(dirPath, (err) => {
-      if (err) reject(new Error(`Failed to create directory: ${err.message}`));
-      else resolve(`Directory created: ${args.path}`);
-    });
-  });
+  // Use recursive mkdir to handle nested paths like "a/b/c"
+  await mkdirRecursive(sftp, dirPath);
+  return `Directory created: ${args.path}`;
 }
 
 async function handlePsRename(args) {
   const sftp = await connectSftp();
   const oldPath = resolvePath(args.old_path);
   const newPath = resolvePath(args.new_path);
+
+  // Auto-create destination parent directory
+  const destDir = newPath.substring(0, newPath.lastIndexOf("/"));
+  await mkdirRecursive(sftp, destDir);
 
   return new Promise((resolve, reject) => {
     sftp.rename(oldPath, newPath, (err) => {
@@ -408,19 +419,49 @@ async function handlePsDelete(args) {
   const targetPath = resolvePath(args.path);
   const isDir = args.is_directory || false;
 
-  return new Promise((resolve, reject) => {
-    if (isDir) {
-      sftp.rmdir(targetPath, (err) => {
-        if (err) reject(new Error(`Failed to delete directory: ${err.message}`));
-        else resolve(`Directory deleted: ${args.path}`);
+  if (isDir) {
+    // Recursive delete for directories (handles non-empty)
+    async function deleteDir(dirPath) {
+      const items = await new Promise((resolve, reject) => {
+        sftp.readdir(dirPath, (err, list) => {
+          if (err) reject(new Error(err.message));
+          else resolve(list || []);
+        });
       });
-    } else {
+      for (const item of items) {
+        const fullPath = `${dirPath}/${item.filename}`;
+        if (item.longname.startsWith("d")) {
+          await deleteDir(fullPath);
+        } else {
+          await new Promise((resolve, reject) => {
+            sftp.unlink(fullPath, (err) => {
+              if (err) reject(new Error(err.message));
+              else resolve();
+            });
+          });
+        }
+      }
+      await new Promise((resolve, reject) => {
+        sftp.rmdir(dirPath, (err) => {
+          if (err) reject(new Error(err.message));
+          else resolve();
+        });
+      });
+    }
+    await deleteDir(targetPath);
+    // Clear cached dirs
+    for (const cached of _createdDirsCache) {
+      if (cached.startsWith(targetPath)) _createdDirsCache.delete(cached);
+    }
+    return `Directory deleted: ${args.path}`;
+  } else {
+    return new Promise((resolve, reject) => {
       sftp.unlink(targetPath, (err) => {
         if (err) reject(new Error(`Failed to delete file: ${err.message}`));
         else resolve(`File deleted: ${args.path}`);
       });
-    }
-  });
+    });
+  }
 }
 
 async function handlePsPushFiles(args) {
@@ -561,27 +602,70 @@ async function handlePsCopy(args) {
   const srcPath = resolvePath(args.source);
   const destPath = resolvePath(args.destination);
 
-  // Ensure destination directory exists
-  const destDir = destPath.substring(0, destPath.lastIndexOf("/"));
-  await mkdirRecursive(sftp, destDir);
-
-  // Read source into buffer then write to destination
-  const content = await new Promise((resolve, reject) => {
-    const chunks = [];
-    const stream = sftp.createReadStream(srcPath);
-    stream.on("data", (chunk) => chunks.push(chunk));
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", (err) => reject(new Error(`Read failed: ${err.message}`)));
+  // Check if source is a file or directory
+  const srcStats = await new Promise((resolve, reject) => {
+    sftp.stat(srcPath, (err, stats) => {
+      if (err) reject(new Error(`Source not found: ${err.message}`));
+      else resolve(stats);
+    });
   });
 
-  await new Promise((resolve, reject) => {
-    const stream = sftp.createWriteStream(destPath);
-    stream.on("close", () => resolve());
-    stream.on("error", (err) => reject(new Error(`Write failed: ${err.message}`)));
-    stream.end(content);
-  });
+  if (srcStats.isDirectory()) {
+    // Recursive directory copy
+    async function copyDir(src, dest) {
+      await mkdirRecursive(sftp, dest);
+      const items = await new Promise((resolve, reject) => {
+        sftp.readdir(src, (err, list) => {
+          if (err) reject(new Error(err.message));
+          else resolve(list || []);
+        });
+      });
+      for (const item of items) {
+        const srcItem = `${src}/${item.filename}`;
+        const destItem = `${dest}/${item.filename}`;
+        if (item.longname.startsWith("d")) {
+          await copyDir(srcItem, destItem);
+        } else {
+          const content = await new Promise((resolve, reject) => {
+            const chunks = [];
+            const stream = sftp.createReadStream(srcItem);
+            stream.on("data", (chunk) => chunks.push(chunk));
+            stream.on("end", () => resolve(Buffer.concat(chunks)));
+            stream.on("error", (err) => reject(new Error(err.message)));
+          });
+          await new Promise((resolve, reject) => {
+            const stream = sftp.createWriteStream(destItem);
+            stream.on("close", () => resolve());
+            stream.on("error", (err) => reject(new Error(err.message)));
+            stream.end(content);
+          });
+        }
+      }
+    }
+    await copyDir(srcPath, destPath);
+    return `Copied directory: ${args.source} → ${args.destination}`;
+  } else {
+    // Single file copy
+    const destDir = destPath.substring(0, destPath.lastIndexOf("/"));
+    await mkdirRecursive(sftp, destDir);
 
-  return `Copied: ${args.source} → ${args.destination}`;
+    const content = await new Promise((resolve, reject) => {
+      const chunks = [];
+      const stream = sftp.createReadStream(srcPath);
+      stream.on("data", (chunk) => chunks.push(chunk));
+      stream.on("end", () => resolve(Buffer.concat(chunks)));
+      stream.on("error", (err) => reject(new Error(`Read failed: ${err.message}`)));
+    });
+
+    await new Promise((resolve, reject) => {
+      const stream = sftp.createWriteStream(destPath);
+      stream.on("close", () => resolve());
+      stream.on("error", (err) => reject(new Error(`Write failed: ${err.message}`)));
+      stream.end(content);
+    });
+
+    return `Copied: ${args.source} → ${args.destination}`;
+  }
 }
 
 async function handlePsStat(args) {
