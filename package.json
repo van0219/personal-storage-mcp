@@ -1,0 +1,20 @@
+{
+  "name": "personal-storage-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Personal Storage SFTP file operations",
+  "main": "server.js",
+  "type": "module",
+  "bin": {
+    "personal-storage-mcp": "./server.js"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.12.1",
+    "ssh2": "^1.17.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
