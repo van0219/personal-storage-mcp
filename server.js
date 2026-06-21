@@ -6,6 +6,8 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "ssh2";
+import { readFileSync, statSync, readdirSync } from "fs";
+import { join } from "path";
 
 // --- Configuration from environment ---
 const SFTP_HOST = process.env.PS_SFTP_HOST;
@@ -291,6 +293,60 @@ const TOOLS = [
         }
       },
       required: ["path"]
+    }
+  },
+  {
+    name: "ps_append",
+    description: "Append text content to an existing file. Creates the file if it doesn't exist. Use this to write large files in chunks when ps_write_file hits size limits. Call ps_write_file first with the initial content, then ps_append for subsequent chunks.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Relative path to the file within your personal storage."
+        },
+        content: {
+          type: "string",
+          description: "Text content to append to the end of the file."
+        }
+      },
+      required: ["path", "content"]
+    }
+  },
+  {
+    name: "ps_upload_from_sandbox",
+    description: "Upload a file from your local sandbox/workspace filesystem directly to personal storage. This bypasses content size limits since the server reads the file directly from disk. Use this for large files (>10KB) that cannot be passed as tool parameters. The sandbox_path should be an absolute path in your workspace (e.g., '/projects/sandbox/myfile.py').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sandbox_path: {
+          type: "string",
+          description: "Absolute path to the file in your local sandbox/workspace filesystem."
+        },
+        dest_path: {
+          type: "string",
+          description: "Relative destination path within your personal storage."
+        }
+      },
+      required: ["sandbox_path", "dest_path"]
+    }
+  },
+  {
+    name: "ps_upload_dir_from_sandbox",
+    description: "Recursively upload an entire directory from your local sandbox/workspace filesystem to personal storage. Use this instead of copying files one by one. All files and subdirectories are preserved. Existing files at the destination are overwritten.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sandbox_path: {
+          type: "string",
+          description: "Absolute path to the directory in your local sandbox/workspace filesystem."
+        },
+        dest_path: {
+          type: "string",
+          description: "Relative destination path within your personal storage."
+        }
+      },
+      required: ["sandbox_path", "dest_path"]
     }
   }
 ];
@@ -686,6 +742,125 @@ async function handlePsStat(args) {
   });
 }
 
+async function handlePsAppend(args) {
+  const sftp = await connectSftp();
+  const filePath = resolvePath(args.path);
+
+  // Auto-create parent directories
+  const dirPath = filePath.substring(0, filePath.lastIndexOf("/"));
+  await mkdirRecursive(sftp, dirPath);
+
+  // Check if file exists to determine flags
+  const exists = await new Promise((resolve) => {
+    sftp.stat(filePath, (err) => resolve(!err));
+  });
+
+  if (!exists) {
+    // Create new file
+    return new Promise((resolve, reject) => {
+      const stream = sftp.createWriteStream(filePath);
+      stream.on("close", () => resolve(`File created and content written: ${args.path}`));
+      stream.on("error", (err) => reject(new Error(`Failed to write: ${err.message}`)));
+      stream.end(args.content || "");
+    });
+  }
+
+  // Read existing content, append new content
+  const existing = await new Promise((resolve, reject) => {
+    const chunks = [];
+    const stream = sftp.createReadStream(filePath);
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", (err) => reject(new Error(`Read failed: ${err.message}`)));
+  });
+
+  const combined = Buffer.concat([existing, Buffer.from(args.content || "", "utf-8")]);
+
+  return new Promise((resolve, reject) => {
+    const stream = sftp.createWriteStream(filePath);
+    stream.on("close", () => resolve(`Content appended to: ${args.path} (now ${combined.length} bytes)`));
+    stream.on("error", (err) => reject(new Error(`Write failed: ${err.message}`)));
+    stream.end(combined);
+  });
+}
+
+async function handlePsUploadFromSandbox(args) {
+  const sftp = await connectSftp();
+  const destPath = resolvePath(args.dest_path);
+  const sandboxPath = args.sandbox_path;
+
+  // Validate sandbox path exists
+  let fileContent;
+  try {
+    fileContent = readFileSync(sandboxPath);
+  } catch (err) {
+    throw new Error(`Cannot read sandbox file "${sandboxPath}": ${err.message}`);
+  }
+
+  // Auto-create parent directories
+  const dirPath = destPath.substring(0, destPath.lastIndexOf("/"));
+  await mkdirRecursive(sftp, dirPath);
+
+  // Write to SFTP
+  return new Promise((resolve, reject) => {
+    const stream = sftp.createWriteStream(destPath);
+    stream.on("close", () => resolve(`Uploaded ${sandboxPath} → ${args.dest_path} (${fileContent.length} bytes)`));
+    stream.on("error", (err) => reject(new Error(`Upload failed: ${err.message}`)));
+    stream.end(fileContent);
+  });
+}
+
+async function handlePsUploadDirFromSandbox(args) {
+  const sftp = await connectSftp();
+  const destBasePath = resolvePath(args.dest_path);
+  const sandboxPath = args.sandbox_path;
+
+  // Validate sandbox path is a directory
+  let stats;
+  try {
+    stats = statSync(sandboxPath);
+  } catch (err) {
+    throw new Error(`Cannot access sandbox path "${sandboxPath}": ${err.message}`);
+  }
+  if (!stats.isDirectory()) {
+    throw new Error(`"${sandboxPath}" is not a directory. Use ps_upload_from_sandbox for single files.`);
+  }
+
+  // Recursively walk the sandbox directory and upload all files
+  let uploadedCount = 0;
+  let totalBytes = 0;
+
+  async function uploadDir(localDir, remoteDir) {
+    await mkdirRecursive(sftp, remoteDir);
+
+    const entries = readdirSync(localDir, { withFileTypes: true });
+    for (const entry of entries) {
+      // Skip hidden files/folders
+      if (entry.name.startsWith(".")) continue;
+
+      const localPath = join(localDir, entry.name);
+      const remotePath = `${remoteDir}/${entry.name}`;
+
+      if (entry.isDirectory()) {
+        await uploadDir(localPath, remotePath);
+      } else if (entry.isFile()) {
+        const content = readFileSync(localPath);
+        await new Promise((resolve, reject) => {
+          const stream = sftp.createWriteStream(remotePath);
+          stream.on("close", () => resolve());
+          stream.on("error", (err) => reject(new Error(`Upload ${entry.name}: ${err.message}`)));
+          stream.end(content);
+        });
+        uploadedCount++;
+        totalBytes += content.length;
+      }
+    }
+  }
+
+  await uploadDir(sandboxPath, destBasePath);
+  return `Uploaded directory: ${args.sandbox_path} → ${args.dest_path}\n  Files: ${uploadedCount}\n  Total size: ${(totalBytes / 1024).toFixed(1)} KB`;
+}
+
 // --- MCP Server Setup ---
 
 const server = new Server(
@@ -739,6 +914,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "ps_stat":
         result = await handlePsStat(args);
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      case "ps_append":
+        result = await handlePsAppend(args);
+        return { content: [{ type: "text", text: result }] };
+      case "ps_upload_from_sandbox":
+        result = await handlePsUploadFromSandbox(args);
+        return { content: [{ type: "text", text: result }] };
+      case "ps_upload_dir_from_sandbox":
+        result = await handlePsUploadDirFromSandbox(args);
+        return { content: [{ type: "text", text: result }] };
       default:
         return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
     }

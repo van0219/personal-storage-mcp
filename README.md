@@ -10,7 +10,10 @@ MCP server that provides file operations on your personal SFTP storage space (`/
 | `ps_tree` | Recursively list entire directory tree (with depth control) |
 | `ps_read_file` | Read text content of a file (max 5MB) |
 | `ps_write_file` | Create or overwrite a file (auto-creates parent directories) |
+| `ps_append` | Append content to a file (create if missing). Use for chunked writes of large files |
 | `ps_push_files` | Write multiple files in one call (auto-creates directories) |
+| `ps_upload_from_sandbox` | Upload a file directly from sandbox filesystem to personal storage (bypasses token limits) |
+| `ps_upload_dir_from_sandbox` | Recursively upload an entire directory from sandbox to personal storage |
 | `ps_mkdir` | Create a new folder |
 | `ps_rename` | Rename or move a file/folder |
 | `ps_copy` | Copy a file to a new path (auto-creates destination directories) |
@@ -63,6 +66,41 @@ Requires `confirm: true` to proceed. Deletes all files and subdirectories within
 ```json
 {"path": "old-project", "confirm": true}
 ```
+
+### ps_append — Chunked Write for Large Files
+
+When `ps_write_file` hits token/parameter limits (files >10KB), use `ps_append` to write in chunks:
+
+```json
+// Step 1: Write the first chunk
+{"tool": "ps_write_file", "args": {"path": "big-file.py", "content": "# first 200 lines..."}}
+
+// Step 2: Append remaining chunks
+{"tool": "ps_append", "args": {"path": "big-file.py", "content": "# next 200 lines..."}}
+{"tool": "ps_append", "args": {"path": "big-file.py", "content": "# final lines..."}}
+```
+
+Creates the file if it doesn't exist. Reads existing content and appends new content.
+
+### ps_upload_from_sandbox — Direct File Transfer (Recommended for Large Files)
+
+Bypasses tool parameter size limits entirely by reading the file from the sandbox filesystem:
+
+```json
+{"sandbox_path": "/projects/sandbox/pflow_analyzer/ReusableTools/big_script.py", "dest_path": "pflow_analyzer_web/ReusableTools/big_script.py"}
+```
+
+The MCP server reads the file from disk and streams it directly to SFTP. No content passes through tool parameters. Works for any file size.
+
+### ps_upload_dir_from_sandbox — Bulk Directory Transfer
+
+Upload an entire project directory in one call:
+
+```json
+{"sandbox_path": "/projects/sandbox/pflow_analyzer/ReusableTools", "dest_path": "pflow_analyzer_web/ReusableTools"}
+```
+
+Recursively copies all files and subdirectories. Reports total file count and bytes transferred. Existing files are overwritten.
 
 ### ps_file_exists — Quick Check
 
