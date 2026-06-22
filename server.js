@@ -6,8 +6,8 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "ssh2";
-import { readFileSync, statSync, readdirSync } from "fs";
-import { join } from "path";
+import { readFileSync, statSync, readdirSync, writeFileSync, mkdirSync } from "fs";
+import { join, dirname } from "path";
 
 // --- Configuration from environment ---
 const SFTP_HOST = process.env.PS_SFTP_HOST;
@@ -347,6 +347,42 @@ const TOOLS = [
         }
       },
       required: ["sandbox_path", "dest_path"]
+    }
+  },
+  {
+    name: "ps_download_to_sandbox",
+    description: "Download a file from personal storage directly to your local sandbox/workspace filesystem. This bypasses MCP text parameter limits and preserves binary content (docx, xlsx, pdf, images, etc.). Use this for any file that needs to be processed locally by scripts or tools.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Relative path to the file within your personal storage."
+        },
+        sandbox_path: {
+          type: "string",
+          description: "Absolute destination path in your local sandbox/workspace filesystem (e.g., '/home/user/project/Temp/myfile.docx')."
+        }
+      },
+      required: ["path", "sandbox_path"]
+    }
+  },
+  {
+    name: "ps_download_dir_to_sandbox",
+    description: "Recursively download an entire directory from personal storage to your local sandbox/workspace filesystem. Preserves all files and subdirectories with their binary content intact. Use this to bring a full folder of inputs to the sandbox for local processing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Relative path to the directory within your personal storage."
+        },
+        sandbox_path: {
+          type: "string",
+          description: "Absolute destination path in your local sandbox/workspace filesystem (e.g., '/home/user/project/Temp/inputs/')."
+        }
+      },
+      required: ["path", "sandbox_path"]
     }
   }
 ];
@@ -861,6 +897,105 @@ async function handlePsUploadDirFromSandbox(args) {
   return `Uploaded directory: ${args.sandbox_path} → ${args.dest_path}\n  Files: ${uploadedCount}\n  Total size: ${(totalBytes / 1024).toFixed(1)} KB`;
 }
 
+async function handlePsDownloadToSandbox(args) {
+  const sftp = await connectSftp();
+  const srcPath = resolvePath(args.path);
+  const sandboxPath = args.sandbox_path;
+
+  // Ensure local parent directory exists
+  const parentDir = dirname(sandboxPath);
+  try {
+    mkdirSync(parentDir, { recursive: true });
+  } catch (err) {
+    throw new Error(`Cannot create local directory "${parentDir}": ${err.message}`);
+  }
+
+  // Download file from SFTP as binary buffer
+  const content = await new Promise((resolve, reject) => {
+    const chunks = [];
+    const stream = sftp.createReadStream(srcPath);
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", (err) => reject(new Error(`Failed to read from personal storage: ${err.message}`)));
+  });
+
+  // Write to local sandbox filesystem
+  try {
+    writeFileSync(sandboxPath, content);
+  } catch (err) {
+    throw new Error(`Cannot write to sandbox path "${sandboxPath}": ${err.message}`);
+  }
+
+  return `Downloaded ${args.path} → ${sandboxPath} (${content.length} bytes)`;
+}
+
+async function handlePsDownloadDirToSandbox(args) {
+  const sftp = await connectSftp();
+  const srcPath = resolvePath(args.path);
+  const sandboxPath = args.sandbox_path;
+
+  // Verify source is a directory on SFTP
+  const srcStats = await new Promise((resolve, reject) => {
+    sftp.stat(srcPath, (err, stats) => {
+      if (err) reject(new Error(`Source not found on personal storage: ${err.message}`));
+      else resolve(stats);
+    });
+  });
+
+  if (!srcStats.isDirectory()) {
+    throw new Error(`"${args.path}" is not a directory. Use ps_download_to_sandbox for single files.`);
+  }
+
+  // Ensure local base directory exists
+  try {
+    mkdirSync(sandboxPath, { recursive: true });
+  } catch (err) {
+    throw new Error(`Cannot create local directory "${sandboxPath}": ${err.message}`);
+  }
+
+  let downloadedCount = 0;
+  let totalBytes = 0;
+
+  async function downloadDir(remoteDirPath, localDirPath) {
+    // Ensure local directory exists
+    mkdirSync(localDirPath, { recursive: true });
+
+    const items = await new Promise((resolve, reject) => {
+      sftp.readdir(remoteDirPath, (err, list) => {
+        if (err) reject(new Error(`Failed to list ${remoteDirPath}: ${err.message}`));
+        else resolve(list || []);
+      });
+    });
+
+    for (const item of items) {
+      if (item.filename.startsWith(".")) continue;
+
+      const remotePath = `${remoteDirPath}/${item.filename}`;
+      const localPath = join(localDirPath, item.filename);
+
+      if (item.longname.startsWith("d")) {
+        await downloadDir(remotePath, localPath);
+      } else {
+        // Download file
+        const content = await new Promise((resolve, reject) => {
+          const chunks = [];
+          const stream = sftp.createReadStream(remotePath);
+          stream.on("data", (chunk) => chunks.push(chunk));
+          stream.on("end", () => resolve(Buffer.concat(chunks)));
+          stream.on("error", (err) => reject(new Error(`Read ${item.filename}: ${err.message}`)));
+        });
+
+        writeFileSync(localPath, content);
+        downloadedCount++;
+        totalBytes += content.length;
+      }
+    }
+  }
+
+  await downloadDir(srcPath, sandboxPath);
+  return `Downloaded directory: ${args.path} → ${sandboxPath}\n  Files: ${downloadedCount}\n  Total size: ${(totalBytes / 1024).toFixed(1)} KB`;
+}
+
 // --- MCP Server Setup ---
 
 const server = new Server(
@@ -922,6 +1057,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: result }] };
       case "ps_upload_dir_from_sandbox":
         result = await handlePsUploadDirFromSandbox(args);
+        return { content: [{ type: "text", text: result }] };
+      case "ps_download_to_sandbox":
+        result = await handlePsDownloadToSandbox(args);
+        return { content: [{ type: "text", text: result }] };
+      case "ps_download_dir_to_sandbox":
+        result = await handlePsDownloadDirToSandbox(args);
         return { content: [{ type: "text", text: result }] };
       default:
         return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
