@@ -351,7 +351,7 @@ const TOOLS = [
   },
   {
     name: "ps_download_to_sandbox",
-    description: "Download a file from personal storage directly to your local sandbox/workspace filesystem. This bypasses MCP text parameter limits and preserves binary content (docx, xlsx, pdf, images, etc.). Use this for any file that needs to be processed locally by scripts or tools.",
+    description: "Download a file from personal storage directly to your local sandbox/workspace filesystem. This bypasses MCP text parameter limits and preserves binary content (docx, xlsx, pdf, images, etc.). IMPORTANT: Do NOT read the file with ps_read_file first — call this tool directly with just the paths. Only two short string parameters are needed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -369,7 +369,7 @@ const TOOLS = [
   },
   {
     name: "ps_download_dir_to_sandbox",
-    description: "Recursively download an entire directory from personal storage to your local sandbox/workspace filesystem. Preserves all files and subdirectories with their binary content intact. Use this to bring a full folder of inputs to the sandbox for local processing.",
+    description: "Recursively download an entire directory from personal storage to your local sandbox/workspace filesystem. Preserves all files and subdirectories with their binary content intact. Use this to bring a full folder of inputs to the sandbox for local processing. IMPORTANT: Do NOT list or read files first — just call this with the directory path.",
     inputSchema: {
       type: "object",
       properties: {
@@ -383,6 +383,34 @@ const TOOLS = [
         }
       },
       required: ["path", "sandbox_path"]
+    }
+  },
+  {
+    name: "ps_download_files_to_sandbox",
+    description: "Download multiple files from personal storage to the sandbox in a single call. Use this instead of calling ps_download_to_sandbox multiple times. Each file specifies its source path in personal storage and destination path in the sandbox. Handles both text and binary files.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        files: {
+          type: "array",
+          description: "Array of file transfers. Each item has a source path (in personal storage) and destination path (in sandbox).",
+          items: {
+            type: "object",
+            properties: {
+              path: {
+                type: "string",
+                description: "Relative source path within personal storage."
+              },
+              sandbox_path: {
+                type: "string",
+                description: "Absolute destination path in the sandbox."
+              }
+            },
+            required: ["path", "sandbox_path"]
+          }
+        }
+      },
+      required: ["files"]
     }
   }
 ];
@@ -996,6 +1024,48 @@ async function handlePsDownloadDirToSandbox(args) {
   return `Downloaded directory: ${args.path} → ${sandboxPath}\n  Files: ${downloadedCount}\n  Total size: ${(totalBytes / 1024).toFixed(1)} KB`;
 }
 
+async function handlePsDownloadFilesToSandbox(args) {
+  const sftp = await connectSftp();
+  const files = args.files || [];
+  if (files.length === 0) return "No files to download.";
+
+  const results = [];
+  let totalBytes = 0;
+
+  for (const file of files) {
+    const srcPath = resolvePath(file.path);
+    const sandboxPath = file.sandbox_path;
+
+    // Ensure local parent directory exists
+    const parentDir = dirname(sandboxPath);
+    try {
+      mkdirSync(parentDir, { recursive: true });
+    } catch (err) {
+      results.push(`  ✗ ${file.path} — cannot create dir: ${err.message}`);
+      continue;
+    }
+
+    // Download from SFTP
+    try {
+      const content = await new Promise((resolve, reject) => {
+        const chunks = [];
+        const stream = sftp.createReadStream(srcPath);
+        stream.on("data", (chunk) => chunks.push(chunk));
+        stream.on("end", () => resolve(Buffer.concat(chunks)));
+        stream.on("error", (err) => reject(err));
+      });
+
+      writeFileSync(sandboxPath, content);
+      totalBytes += content.length;
+      results.push(`  ✓ ${file.path} (${content.length} bytes)`);
+    } catch (err) {
+      results.push(`  ✗ ${file.path} — ${err.message}`);
+    }
+  }
+
+  return `Downloaded ${results.filter(r => r.includes("✓")).length}/${files.length} file(s):\n${results.join("\n")}\n  Total: ${(totalBytes / 1024).toFixed(1)} KB`;
+}
+
 // --- MCP Server Setup ---
 
 const server = new Server(
@@ -1063,6 +1133,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: result }] };
       case "ps_download_dir_to_sandbox":
         result = await handlePsDownloadDirToSandbox(args);
+        return { content: [{ type: "text", text: result }] };
+      case "ps_download_files_to_sandbox":
+        result = await handlePsDownloadFilesToSandbox(args);
         return { content: [{ type: "text", text: result }] };
       default:
         return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
